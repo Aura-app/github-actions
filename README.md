@@ -148,5 +148,3 @@ Optionally set a `MODEL` variable in **Settings > Variables** to override the de
 | `general_guidelines_path` | No | `REVIEW_GUIDELINES.md` | Path to repo-root general guidelines |
 
 ## License
-
-MIT
