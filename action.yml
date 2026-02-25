@@ -1,0 +1,158 @@
+name: "Cursor Code Review"
+description: "Automated AI code review using Cursor, scoped to configurable folder paths with custom guidelines"
+author: "Aura-app"
+
+branding:
+  icon: "code"
+  color: "blue"
+
+inputs:
+  scope_path:
+    description: "Folder prefix to review (e.g. 'apis/'). Use './' to review the entire repo as a single scope."
+    required: true
+  folder_guidelines_path:
+    description: "Path to the folder-specific review guidelines markdown file"
+    required: true
+  folder_label:
+    description: "Human-readable label for this scope (used to prefix PR comments for parallel review jobs)"
+    required: true
+  model:
+    description: "Cursor model to use (defaults to gpt-5.2 if empty)"
+    required: false
+    default: ""
+  cursor_api_key:
+    description: "Cursor API key for authentication"
+    required: true
+  general_guidelines_path:
+    description: "Path to the repo-root general review guidelines file"
+    required: false
+    default: "REVIEW_GUIDELINES.md"
+
+runs:
+  using: composite
+  steps:
+    - name: Install Cursor CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl https://cursor.com/install -fsS | bash
+        echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+
+    - name: Configure git identity
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config user.name "Cursor Agent"
+        git config user.email "cursoragent@cursor.com"
+
+    - name: Install jq
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y jq
+
+    - name: Perform automated code review
+      shell: bash
+      env:
+        CURSOR_API_KEY: ${{ inputs.cursor_api_key }}
+        GH_TOKEN: ${{ github.token }}
+        MODEL: ${{ inputs.model }}
+        SCOPE_PATH: ${{ inputs.scope_path }}
+        FOLDER_GUIDELINES_PATH: ${{ inputs.folder_guidelines_path }}
+        FOLDER_LABEL: ${{ inputs.folder_label }}
+        GENERAL_GUIDELINES_PATH: ${{ inputs.general_guidelines_path }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${MODEL:-}" ]; then
+          MODEL="gpt-5.2"
+        fi
+
+        if [ ! -s "$GENERAL_GUIDELINES_PATH" ]; then
+          echo "Missing or empty general review guidelines: $GENERAL_GUIDELINES_PATH"
+          echo "Add REVIEW_GUIDELINES.md at the repo root to proceed."
+          exit 1
+        fi
+
+        if [ -z "${FOLDER_GUIDELINES_PATH:-}" ]; then
+          echo "Missing FOLDER_GUIDELINES_PATH input."
+          exit 1
+        fi
+
+        if [ ! -s "$FOLDER_GUIDELINES_PATH" ]; then
+          echo "Missing or empty folder review guidelines: $FOLDER_GUIDELINES_PATH"
+          echo "This folder is configured for automated review; add REVIEW_GUIDELINES.md in that folder to proceed."
+          exit 1
+        fi
+
+        GENERAL_GUIDELINES="$(cat "$GENERAL_GUIDELINES_PATH")"
+        FOLDER_GUIDELINES="$(cat "$FOLDER_GUIDELINES_PATH")"
+
+        REPO="${{ github.repository }}"
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+        PR_HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+        PR_BASE_SHA="${{ github.event.pull_request.base.sha }}"
+
+        PROMPT="$(cat <<EOF
+        You are operating in a GitHub Actions runner performing automated code review for a monorepo.
+        The gh CLI is available and authenticated via GH_TOKEN. You may comment on pull requests.
+
+        Important:
+        - This run is scoped to ${SCOPE_PATH}. Treat it as authoritative that you must not review or comment on files outside that scope.
+        - To avoid interference with other parallel review jobs for different folders, prefix ANY top-level summary comment bodies you create with:
+          [Cursor Review: ${SCOPE_PATH}]
+
+        Context:
+        - Repo: ${REPO}
+        - PR Number: ${PR_NUMBER}
+        - PR Head SHA: ${PR_HEAD_SHA}
+        - PR Base SHA: ${PR_BASE_SHA}
+
+        Scope:
+        - Review ONLY changes that are under ${SCOPE_PATH}.
+
+        General review guidelines (authoritative):
+        ${GENERAL_GUIDELINES}
+
+        Folder review guidelines for ${SCOPE_PATH} (${FOLDER_LABEL}) (authoritative):
+        ${FOLDER_GUIDELINES}
+
+        Objectives:
+        1) Follow the guidelines above. Do not introduce additional review criteria beyond those documents.
+        2) Re-check existing review comments and reply resolved when addressed (when applicable).
+        3) Leave short, actionable inline comments on changed lines only and a brief summary at the end.
+
+        Procedure:
+        - Get existing comments: gh pr view --json comments
+        - Get diff: gh pr diff
+        - Get changed files with patches to compute inline positions:
+          gh api repos/${REPO}/pulls/${PR_NUMBER}/files --paginate --jq '.[] | {filename,patch}'
+        - Compute exact inline anchors for each issue (file path + diff position). Comments MUST be placed inline on the changed line in the diff, not as top-level comments.
+        - Detect prior top-level \"no issues\" style comments authored by this bot for THIS scope only:
+          - Only consider comments that include the exact prefix: [Cursor Review: ${SCOPE_PATH}]
+          - Match bodies like: \"✅ no issues\", \"No issues found\", \"LGTM\" (after the prefix).
+        - If CURRENT run finds issues and any prior \"no issues\" comments exist for THIS scope:
+          - Prefer to remove them to avoid confusion:
+            - Try deleting top-level issue comments via: gh api -X DELETE repos/${REPO}/issues/comments/<comment_id>
+            - If deletion isn't possible, minimize them via GraphQL (minimizeComment) or edit to prefix \"[Superseded by new findings]\".
+          - If neither delete nor minimize is possible, reply to that comment: \"Superseded: issues were found in newer commits\".
+        - If a previously reported issue appears fixed by nearby changes, reply: \"✅ This issue appears to be resolved by the recent changes\".
+
+        Submission:
+        - If there are NO issues to report and an existing top-level comment indicating \"no issues\" already exists for THIS scope (prefix: [Cursor Review: ${SCOPE_PATH}]), do NOT submit another comment.
+        - If there are NO issues to report and NO prior \"no issues\" comment exists for THIS scope, submit one brief summary comment noting no issues, prefixed with: [Cursor Review: ${SCOPE_PATH}]
+        - If there ARE issues to report, submit ONE review containing ONLY inline comments plus an optional concise summary body.
+        - Use the GitHub Reviews API to ensure comments are inline. Avoid shell quoting bugs by sending a JSON payload via jq + --input:
+          COMMENTS_JSON=\$(jq -nc --arg path \"<file>\" --arg body \"<comment>\" --argjson position <diff_position> \"[{path:\\\$path,position:\\\$position,body:\\\$body}]\")
+          jq -nc --arg event COMMENT --arg body \"<summary>\" --argjson comments \"\\\$COMMENTS_JSON\" \"{event:\\\$event,body:\\\$body,comments:\\\$comments}\" > review.json
+          gh api repos/${REPO}/pulls/${PR_NUMBER}/reviews --input review.json
+        - Do NOT use: gh pr review --approve or --request-changes
+        EOF
+        )"
+
+        echo "::group::Cursor review prompt"
+        printf '%s\n' "$PROMPT"
+        echo "::endgroup::"
+
+        agent --force --model "$MODEL" --output-format=text --print "$PROMPT"

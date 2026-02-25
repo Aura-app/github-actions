@@ -1,0 +1,14 @@
+{
+  "scopes": [
+    {
+      "path": "backend/",
+      "guidelines": "backend/REVIEW_GUIDELINES.md",
+      "label": "Backend"
+    },
+    {
+      "path": "frontend/",
+      "guidelines": "frontend/REVIEW_GUIDELINES.md",
+      "label": "Frontend"
+    }
+  ]
+}
